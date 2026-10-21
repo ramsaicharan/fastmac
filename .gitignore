@@ -1,0 +1,20 @@
+# Build output
+.build*/
+build/
+*.app/
+.swiftpm/
+DerivedData/
+
+# Generated verification output (regenerate with the --*-check flags)
+.verification/
+.verification-*.log
+.quick-actions-*.log
+
+# Local-only material: private research, legacy app folder
+research/
+MacApp/
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store

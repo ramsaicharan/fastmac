@@ -1,0 +1,44 @@
+name: Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please don't include personal file paths or screenshots showing
+        private data. For security issues, use private reporting instead (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the dashboard
+        2. Click Scan Mac
+        3. …
+  - type: input
+    id: version
+    attributes:
+      label: FastMac version
+      description: FastMac menu → About FastMac
+      placeholder: "2.0.0"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac model
+      placeholder: "macOS 15.4, MacBook Air M2"
+    validations:
+      required: true
+  - type: dropdown
+    id: fda
+    attributes:
+      label: Does FastMac have Full Disk Access?
+      options: ["Yes", "No", "Not sure"]

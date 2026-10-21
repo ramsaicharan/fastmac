@@ -1,0 +1,552 @@
+#!/bin/bash
+# mactidy — disk + memory analyzer and safe cleaner for macOS
+# Usage: ./mactidy scan | mem | clean [cat...] [--apply] | list | help
+
+set -uo pipefail
+VERSION="1.0"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'
+YEL=$'\033[33m'; BLU=$'\033[34m'; CYN=$'\033[36m'; RST=$'\033[0m'
+[ -t 1 ] || { BOLD=""; DIM=""; RED=""; GRN=""; YEL=""; BLU=""; CYN=""; RST=""; }
+
+APPLY=0
+STATE_DIR="${HOME}/.mactidy"
+LOG="${STATE_DIR}/cleanup.log"
+STALE_DAYS="${MACTIDY_STALE_DAYS:-60}"   # age threshold for build dirs
+STALE_MIN=$((50*1024*1024))            # ignore stale dirs under 50 MB
+STALE_NAMES="${MACTIDY_STALE_NAMES:-node_modules .venv venv build target .next dist __pycache__}"
+
+# ─────────────────────────── helpers ───────────────────────────
+
+human() { # bytes -> human
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KB MB GB TB",u," "); i=1
+    while (b>=1024 && i<5){ b/=1024; i++ }
+    printf (i<=2 ? "%.0f %s" : "%.1f %s"), b, u[i]
+  }'
+}
+
+size_of() { # path -> bytes (0 if missing/unreadable)
+  [ -e "$1" ] || { echo 0; return; }
+  local kb
+  kb=$(du -sk "$1" 2>/dev/null | awk 'NR==1{print $1+0; exit}')
+  echo $(( ${kb:-0} * 1024 ))
+}
+
+rule() { printf "${DIM}%s${RST}\n" "────────────────────────────────────────────────────────────────"; }
+head2() { printf "\n${BOLD}${CYN}%s${RST}\n" "$1"; rule; }
+
+# Deletion guard: only allow paths inside $HOME, never these.
+PROTECTED=(
+  "$HOME" "$HOME/Documents" "$HOME/Downloads" "$HOME/Desktop"
+  "$HOME/Library" "$HOME/Pictures" "$HOME/Movies" "$HOME/Music" "$HOME/.ssh"
+  "$HOME/.Trash" "$STATE_DIR"
+)
+safe_target() {
+  local p="${1%/}"
+  [ -e "$p" ] || [ -L "$p" ] || return 1
+  [ -L "$p" ] && return 1
+  case "/$p/" in */../*) return 1 ;; esac
+  local rp
+  rp=$(realpath "$p" 2>/dev/null) || return 1
+  case "$rp" in
+    "$HOME"/*) ;;
+    *) return 1 ;;
+  esac
+  local prot
+  for prot in "${PROTECTED[@]}"; do
+    [ "$rp" = "${prot%/}" ] && return 1
+  done
+  case "$rp" in "$HOME/.Trash"/*|"$STATE_DIR"/*) return 1 ;; esac
+  local mount
+  mount=$(stat -f '%m' "$rp" 2>/dev/null || true)
+  [ "$mount" = "$rp" ] && [ "$rp" != "$HOME" ] && return 1
+  return 0
+}
+
+append_log() {
+  local line="$1" tmp
+  mkdir -p "$STATE_DIR"
+  if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 262144 ]; then
+    tmp="${LOG}.$$"
+    tail -c 131072 "$LOG" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG" || rm -f "$tmp"
+  fi
+  printf '%s\n' "$line" >> "$LOG"
+}
+
+# Finder moves an item to the user's Trash. Passing the path as an argument keeps
+# quotes, newlines and shell metacharacters in filenames out of the script source.
+trash_target() {
+  local p="$1"
+  osascript - "$p" <<'APPLESCRIPT'
+on run argv
+  tell application "Finder" to delete POSIX file (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+# ─────────────────────── category registry ───────────────────────
+# name|tier|description|command-or-PATHS:...
+# tier: safe = regenerated automatically | review = check first | manual = you decide
+
+categories() {
+cat <<'EOF'
+npm-cache|safe|npm package cache (re-downloads on demand)|PATHS:$HOME/.npm/_cacache:$HOME/.npm/_npx
+xcode-derived|safe|Xcode DerivedData (rebuilds on next build)|PATHS:$HOME/Library/Developer/Xcode/DerivedData
+chrome-cache|safe|Chrome HTTP/code cache (all profiles)|PATHS:$HOME/Library/Caches/Google/Chrome
+sim-unavailable|safe|iOS simulators for uninstalled runtimes|CMD:sim-unavailable
+pip-cache|safe|pip wheel/http cache|PATHS:$HOME/Library/Caches/pip
+app-updaters|safe|Squirrel/ShipIt installer staging caches|PATHS:$HOME/Library/Caches/com.anthropic.claudefordesktop.ShipIt:$HOME/Library/Caches/com.fellou.ai.ShipIt:$HOME/Library/Caches/cluely-updater:$HOME/Library/Caches/fellou-updater:$HOME/Library/Caches/antigravity-updater
+brew-cache|safe|Homebrew download cache|CMD:brew-cache
+gradle-cache|safe|Gradle build caches + daemon logs|PATHS:$HOME/.gradle/caches:$HOME/.gradle/daemon
+pnpm-yarn|safe|pnpm store + Yarn cache|PATHS:$HOME/Library/Caches/pnpm:$HOME/Library/Caches/Yarn:$HOME/Library/Caches/node-gyp
+playwright|review|Playwright/puppeteer browser downloads (re-installable)|PATHS:$HOME/Library/Caches/ms-playwright:$HOME/Library/Caches/ms-playwright-go:$HOME/Library/Application Support/pyppeteer
+codex-sessions|review|Codex CLI session transcripts + history DB|PATHS:$HOME/.codex/sessions:$HOME/.codex/thread_history_1.sqlite:$HOME/.codex/logs_2.sqlite
+antigravity-backup|review|Duplicate Antigravity IDE backup copy|PATHS:$HOME/.gemini/antigravity-backup
+claude-cache|review|Claude Desktop web caches (not your chats)|PATHS:$HOME/Library/Application Support/Claude/Cache:$HOME/Library/Application Support/Claude/Code Cache:$HOME/Library/Application Support/Claude/GPUCache
+xcode-docs|review|Xcode downloaded documentation cache|PATHS:$HOME/Library/Developer/Xcode/DocumentationCache
+orphan-app-data|review|Data left behind by apps no longer installed|PATHS:$HOME/Library/Application Support/io.flutterflow.prod.mac:$HOME/Library/Application Support/com.wondershare.Installer:$HOME/Library/Application Support/Microsoft Edge:$HOME/Library/Application Support/Dia
+antigravity-dupes|review|Two stale duplicate copies of the Antigravity tree|PATHS:$HOME/.gemini/antigravity-backup:$HOME/.gemini/antigravity-ide
+installers|review|Downloaded .dmg/.pkg installers (re-downloadable)|CMD:installers
+trash|review|Empty the Trash|PATHS:$HOME/.Trash
+EOF
+}
+
+cat_field() { echo "$1" | cut -d'|' -f"$2"; }
+
+expand_paths() { # "PATHS:a:b" -> newline list (handles $HOME)
+  local spec="${1#PATHS:}"
+  local IFS=':' part
+  for part in $spec; do
+    part="${part//\$HOME/$HOME}"
+    [ -n "$part" ] && echo "$part"
+  done
+}
+
+cat_size() { # category line -> bytes
+  local action; action=$(cat_field "$1" 4)
+  case "$action" in
+    PATHS:*)
+      local total=0 p
+      while IFS= read -r p; do total=$(( total + $(size_of "$p") )); done < <(expand_paths "$action")
+      echo "$total" ;;
+    CMD:*)
+      case "$action" in
+        *sim-unavailable*|*simctl*) sim_unavailable_bytes ;;
+        *brew-cache*|*brew*)   size_of "$(brew --cache 2>/dev/null || echo /nonexistent)" ;;
+        *installers*|*Downloads*) find "$HOME/Downloads" -maxdepth 1 \( -name "*.dmg" -o -name "*.pkg" \) -print0 2>/dev/null \
+                     | xargs -0 du -sk 2>/dev/null | awk '{s+=$1} END{print (s+0)*1024}' ;;
+        *) echo 0 ;;
+      esac ;;
+  esac
+}
+
+sim_unavailable_bytes() {
+  local dev="$HOME/Library/Developer/CoreSimulator/Devices"
+  [ -d "$dev" ] || { echo 0; return; }
+  local ids
+  ids=$(xcrun simctl list devices 2>/dev/null | awk '/unavailable/ {
+      if (match($0, /[0-9A-F]{8}-[0-9A-F-]{27}/)) print substr($0, RSTART, RLENGTH) }')
+  local total=0 id
+  for id in $ids; do total=$(( total + $(size_of "$dev/$id") )); done
+  echo "$total"
+}
+
+# ───────────────────────────── scan ─────────────────────────────
+
+cmd_scan() {
+  head2 "DISK"
+  df -h / /System/Volumes/Data 2>/dev/null | awk 'NR==1||/Volumes\/Data|disk3s1s1/ {print "  "$0}'
+  local free used pct
+  free=$(df -k /System/Volumes/Data | awk 'NR==2{print $4*1024}')
+  pct=$(df -k /System/Volumes/Data | awk 'NR==2{gsub("%","",$5); print $5}')
+  echo
+  printf "  Free: ${BOLD}%s${RST}   Used: ${BOLD}%s%%${RST}" "$(human "$free")" "$pct"
+  if [ "$pct" -ge 90 ]; then printf "  ${RED}← critical${RST}\n"
+  elif [ "$pct" -ge 80 ]; then printf "  ${YEL}← tight${RST}\n"
+  else printf "  ${GRN}← healthy${RST}\n"; fi
+
+  head2 "RECLAIMABLE"
+  printf "  ${DIM}%-20s %10s  %-7s %s${RST}\n" "CATEGORY" "SIZE" "TIER" "WHAT IT IS"
+  local total=0 safe_total=0 line name tier desc bytes color
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name=$(cat_field "$line" 1); tier=$(cat_field "$line" 2); desc=$(cat_field "$line" 3)
+    bytes=$(cat_size "$line")
+    [ "$bytes" -lt 52428800 ] && continue   # skip < 50 MB
+    total=$(( total + bytes ))
+    case "$tier" in
+      safe)   color="$GRN"; safe_total=$(( safe_total + bytes )) ;;
+      review) color="$YEL" ;;
+      *)      color="$DIM" ;;
+    esac
+    printf "  %-20s %10s  ${color}%-7s${RST} ${DIM}%s${RST}\n" "$name" "$(human "$bytes")" "$tier" "$desc"
+  done < <(categories)
+  rule
+  printf "  %-20s ${BOLD}%10s${RST}  ${GRN}safe-tier: %s${RST}\n" "TOTAL" "$(human "$total")" "$(human "$safe_total")"
+
+  head2 "BIG DIRECTORIES (top-level, live data — review manually)"
+  du -sk -x "$HOME"/* "$HOME"/.[a-z]* 2>/dev/null | sort -rn | head -12 | \
+    while read -r kb path; do
+      printf "  %10s  %s\n" "$(human $((kb*1024)))" "${path/#$HOME/~}"
+    done
+
+  head2 "STALE BUILD ARTIFACTS (untouched ${STALE_DAYS}+ days)"
+  local tmp; tmp=$(mktemp)
+  stale_dirs > "$tmp"
+  local stale_total count
+  stale_total=$(awk '{s+=$1} END{print s+0}' "$tmp")
+  count=$(wc -l < "$tmp" | tr -d ' ')
+  sort -rn "$tmp" | head -10 | while IFS=$'\t' read -r b d; do
+    printf "  %10s  %s\n" "$(human "$b")" "${d/#$HOME/~}"
+  done
+  [ "$count" -gt 10 ] && printf "  ${DIM}… and %d more${RST}\n" $(( count - 10 ))
+  rm -f "$tmp"
+  rule
+  printf "  %10s  ${DIM}across %s directories${RST}\n" "$(human "$stale_total")" "$count"
+  echo
+  printf "  ${DIM}Next: ./mactidy clean            (dry run, safe caches)${RST}\n"
+  printf "  ${DIM}      ./mactidy clean --apply    (move safe caches to Trash)${RST}\n"
+  printf "  ${DIM}      ./mactidy stale --apply    (move stale build dirs to Trash)${RST}\n\n"
+}
+
+# ───────────────────────────── stale ─────────────────────────────
+
+last_activity() { # path -> newest file mtime, falling back to the directory
+  local p="$1" newest
+  newest=$(find "$p" -type f -exec stat -f '%m' {} + 2>/dev/null | awk 'BEGIN{m=0} $1>m{m=$1} END{print m}')
+  if [ "${newest:-0}" -le 0 ]; then
+    newest=$(stat -f '%m' "$p" 2>/dev/null || echo 0)
+  fi
+  echo "${newest:-0}"
+}
+
+stale_dirs() { # emits "bytes<TAB>path"
+  local expr=() n first=1
+  for n in $STALE_NAMES; do
+    [ $first -eq 1 ] && first=0 || expr+=( -o )
+    expr+=( -name "$n" )
+  done
+  local now; now=$(date +%s)
+  find "$HOME/Documents" "$HOME/Downloads" "$HOME/Desktop" -type d \
+       \( "${expr[@]}" \) -prune -print0 2>/dev/null \
+  | while IFS= read -r -d '' d; do
+      local activity age b
+      activity=$(last_activity "$d")
+      age=$(( (now - activity) / 86400 ))
+      [ "$age" -ge "$STALE_DAYS" ] || continue
+      b=$(size_of "$d")
+      [ "$b" -ge "$STALE_MIN" ] && printf "%s\t%s\n" "$b" "$d"
+    done
+}
+
+cmd_stale() {
+  mkdir -p "$STATE_DIR"
+  if [ "$APPLY" -eq 1 ]; then
+    printf "\n${BOLD}${RED}APPLY MODE — stale build directories will move to the Trash.${RST}\n"
+  else
+    printf "\n${BOLD}${BLU}DRY RUN${RST} ${DIM}— nothing is moved. Add --apply to execute.${RST}\n"
+  fi
+  printf "${DIM}Rule: untouched ${STALE_DAYS}+ days, larger than %s.${RST}\n" "$(human "$STALE_MIN")"
+  printf "${DIM}Matching: %s${RST}\n" "$STALE_NAMES"
+  printf "${DIM}Source code is never touched — these all regenerate with one install/build.${RST}\n"
+
+  head2 "STALE BUILD DIRECTORIES"
+  local tmp; tmp=$(mktemp); stale_dirs > "$tmp"
+  local total=0 b d
+  while IFS=$'\t' read -r b d; do
+    do_delete "$d" "$b" && total=$(( total + b ))
+  done < <(sort -rn "$tmp")
+  rm -f "$tmp"
+  rule
+  if [ "$APPLY" -eq 1 ]; then
+    printf "  ${BOLD}${GRN}Moved %s to Trash${RST}   ${DIM}Log: %s${RST}\n\n" "$(human "$total")" "$LOG"
+  else
+    printf "  ${BOLD}Would move %s to Trash${RST}  ${DIM}(./mactidy stale --apply)${RST}\n\n" "$(human "$total")"
+  fi
+}
+
+# ────────────────────────────── mem ──────────────────────────────
+
+cmd_mem() {
+  local psz total
+  psz=$(vm_stat | awk 'NR==1{match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH)}')
+  psz=${psz:-4096}
+  total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  total=${total:-0}
+
+  local free active inactive spec wired compressed stored
+  local values
+  values=$(vm_stat 2>/dev/null | awk -v p="$psz" '
+    /Pages free/             {free=$3*p}
+    /Pages active/           {active=$3*p}
+    /Pages inactive/         {inactive=$3*p}
+    /Pages speculative/      {spec=$3*p}
+    /Pages wired down/       {wired=$4*p}
+    /occupied by compressor/ {compressed=$5*p}
+    /stored in compressor/   {stored=$5*p}
+    END {printf "%d %d %d %d %d %d %d\n", free, active, inactive, spec, wired, compressed, stored}')
+  read -r free active inactive spec wired compressed stored <<< "$values"
+  free=${free:-0}; active=${active:-0}; inactive=${inactive:-0}; spec=${spec:-0}
+  wired=${wired:-0}; compressed=${compressed:-0}; stored=${stored:-0}
+
+  local app=$(( active + inactive + spec ))
+  local used=$(( app + wired + compressed ))
+
+  head2 "MEMORY"
+  printf "  Installed        %10s\n" "$(human "$total")"
+  printf "  App memory       %10s\n" "$(human "$app")"
+  printf "  Wired (kernel)   %10s\n" "$(human "$wired")"
+  printf "  Compressed       %10s  ${DIM}(holds %s of data)${RST}\n" "$(human "$compressed")" "$(human "$stored")"
+  printf "  Free             %10s\n" "$(human "$free")"
+  rule
+  printf "  ${BOLD}In use%s%10s${RST} of %s\n" "           " "$(human "$used")" "$(human "$total")"
+
+  local swap_used swap_total
+  swap_used=$(sysctl -n vm.swapusage | awk '{gsub("M","",$6); print $6}')
+  swap_total=$(sysctl -n vm.swapusage | awk '{gsub("M","",$3); print $3}')
+
+  head2 "PRESSURE"
+  local ratio=0
+  [ "$compressed" -gt 0 ] && ratio=$(awk -v s="$stored" -v c="$compressed" 'BEGIN{printf "%.1f", s/c}')
+  printf "  Compression ratio    %sx  ${DIM}(%s squeezed into %s)${RST}\n" \
+    "$ratio" "$(human "$stored")" "$(human "$compressed")"
+  printf "  Swap in use      %8s MB of %s MB\n" "$swap_used" "$swap_total"
+
+  local verdict
+  if awk "BEGIN{exit !($swap_used > 1024)}"; then
+    verdict="${RED}under pressure${RST} — swapping to disk, expect stalls"
+  elif awk "BEGIN{exit !($swap_used > 256)}"; then
+    verdict="${YEL}moderate${RST} — compressor is working hard"
+  else
+    verdict="${GRN}comfortable${RST}"
+  fi
+  printf "  Verdict          %b\n" "$verdict"
+
+  head2 "TOP CONSUMERS (grouped by app)"
+  ps -Ao rss=,comm= | awk '
+    { rss=$1; $1=""; path=$0
+      n=path
+      if (match(n, /\/[^\/]*\.app\//)) { sub(/\.app\/.*/, "", n); sub(/.*\//, "", n) }
+      else { sub(/.*\//, "", n); gsub(/^ +| +$/, "", n) }
+      if (n=="") next
+      mem[n]+=rss; cnt[n]++ }
+    END { for (k in mem) printf "%d\t%d\t%s\n", mem[k], cnt[k], k }' \
+  | sort -rn | head -12 | while IFS=$'\t' read -r kb n name; do
+      printf "  %10s  ${DIM}%3d proc${RST}  %s\n" "$(human $((kb*1024)))" "$n" "$name"
+    done
+
+  head2 "SUGGESTIONS"
+  local nproc; nproc=$(ps -A | wc -l | tr -d ' ')
+  printf "  • %d processes running.\n" "$nproc"
+  awk "BEGIN{exit !($swap_used > 512)}" && \
+    printf "  • ${YEL}Swap over 512 MB${RST} — quit the heaviest app above and it clears.\n"
+  [ "$ratio" != "0" ] && awk "BEGIN{exit !($ratio > 2.0)}" && \
+    printf "  • Compressor at %sx means RAM is oversubscribed, not just busy.\n" "$ratio"
+  local agents; agents=$(ls "$HOME/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$agents" -gt 0 ] && printf "  • %d user LaunchAgents auto-start at login: ${DIM}ls ~/Library/LaunchAgents${RST}\n" "$agents"
+  printf "  • ${DIM}Purging caches does not free RAM — macOS reclaims it on demand.${RST}\n"
+  printf "  • ${DIM}Freeing disk space does help: a full SSD slows swap badly.${RST}\n\n"
+}
+
+# ───────────────────────────── clean ─────────────────────────────
+
+cmd_list() {
+  head2 "CATEGORIES"
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf "  ${BOLD}%-20s${RST} %-7s ${DIM}%s${RST}\n" \
+      "$(cat_field "$line" 1)" "$(cat_field "$line" 2)" "$(cat_field "$line" 3)"
+  done < <(categories)
+  echo
+}
+
+do_delete() {
+  local p="$1" bytes="$2"
+  if ! safe_target "$p"; then
+    printf "  ${RED}refused${RST} %s ${DIM}(outside allowlist)${RST}\n" "$p"; return 1
+  fi
+  if [ "$APPLY" -eq 1 ]; then
+    if trash_target "$p" >/dev/null 2>&1; then
+      printf "  ${GRN}trashed${RST} %10s  %s\n" "$(human "$bytes")" "${p/#$HOME/~}"
+      append_log "$(date '+%F %T')  trashed  $bytes  $p"
+    else
+      printf "  ${RED}failed ${RST} %10s  %s\n" "$(human "$bytes")" "${p/#$HOME/~}"
+      return 1
+    fi
+  else
+    printf "  ${DIM}would move to Trash${RST} %10s  %s\n" "$(human "$bytes")" "${p/#$HOME/~}"
+  fi
+}
+
+run_category_command() {
+  case "$1" in
+    sim-unavailable)
+      local dev="$HOME/Library/Developer/CoreSimulator/Devices" id failed=0
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        safe_target "$dev/$id" || { failed=1; continue; }
+        trash_target "$dev/$id" >/dev/null 2>&1 || failed=1
+      done < <(xcrun simctl list devices 2>/dev/null | awk '/unavailable/ {
+        if (match($0, /[0-9A-F]{8}-[0-9A-F-]{27}/)) print substr($0, RSTART, RLENGTH) }')
+      return "$failed" ;;
+    brew-cache)
+      local cache p failed=0
+      cache=$(brew --cache 2>/dev/null || echo /nonexistent)
+      [ -d "$cache" ] || return 0
+      while IFS= read -r -d '' p; do
+        safe_target "$p" || { failed=1; continue; }
+        trash_target "$p" >/dev/null 2>&1 || failed=1
+      done < <(find "$cache" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+      return "$failed" ;;
+    installers)
+      local p failed=0
+      while IFS= read -r -d '' p; do
+        safe_target "$p" || { failed=1; continue; }
+        trash_target "$p" >/dev/null 2>&1 || failed=1
+      done < <(find "$HOME/Downloads" -maxdepth 1 \( -name '*.dmg' -o -name '*.pkg' \) -print0 2>/dev/null)
+      return "$failed" ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_clean() {
+  local want=("$@")
+  mkdir -p "$STATE_DIR"
+
+  if [ "$APPLY" -eq 1 ]; then
+    printf "\n${BOLD}${RED}APPLY MODE — selected items will move to the Trash.${RST}\n"
+  else
+    printf "\n${BOLD}${BLU}DRY RUN${RST} ${DIM}— nothing is moved. Add --apply to execute.${RST}\n"
+  fi
+
+  local before; before=$(df -k /System/Volumes/Data | awk 'NR==2{print $4*1024}')
+  local freed=0 line name tier action bytes p
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name=$(cat_field "$line" 1); tier=$(cat_field "$line" 2); action=$(cat_field "$line" 4)
+
+    if [ ${#want[@]} -gt 0 ]; then
+      local match=0 w
+      for w in "${want[@]}"; do [ "$w" = "$name" ] && match=1; done
+      [ "$match" -eq 1 ] || continue
+    else
+      [ "$tier" = "safe" ] || continue      # default: safe tier only
+    fi
+
+    if [ "$name" = "trash" ]; then
+      printf "  ${DIM}review manually in Finder; the existing Trash is never staged${RST}\n"
+      continue
+    fi
+
+    bytes=$(cat_size "$line")
+    [ "$bytes" -lt 1048576 ] && continue
+
+    head2 "$name  ($(human "$bytes"))"
+    case "$action" in
+      PATHS:*)
+        while IFS= read -r p; do
+          [ -e "$p" ] || continue
+          local pbytes
+          pbytes=$(size_of "$p")
+          if do_delete "$p" "$pbytes"; then
+            freed=$(( freed + pbytes ))
+          fi
+        done < <(expand_paths "$action") ;;
+      CMD:*)
+        local c="${action#CMD:}" command_ok=0
+        if [ "$APPLY" -eq 1 ]; then
+          printf "  ${DIM}running:${RST} %s\n" "$c"
+          if run_category_command "$name" >/dev/null 2>&1; then
+            command_ok=1
+            printf "  ${GRN}done${RST}\n"
+            append_log "$(date '+%F %T')  ran      $bytes  $c"
+          else
+            printf "  ${RED}command failed${RST}\n"
+          fi
+        else
+          command_ok=1
+          printf "  ${DIM}would run:${RST} %s\n" "$c"
+        fi
+        [ "$command_ok" -eq 1 ] && freed=$(( freed + bytes )) ;;
+    esac
+  done < <(categories)
+
+  rule
+  if [ "$APPLY" -eq 1 ]; then
+    local after; after=$(df -k /System/Volumes/Data | awk 'NR==2{print $4*1024}')
+    local delta=$(( after - before ))
+    [ "$delta" -lt 0 ] && delta=0
+    printf "  ${BOLD}${GRN}Freed %s${RST}   ${DIM}(free space: %s → %s)${RST}\n" \
+      "$(human "$delta")" "$(human "$before")" "$(human "$after")"
+    printf "  ${DIM}Log: %s${RST}\n\n" "$LOG"
+  else
+    printf "  ${BOLD}Would move about %s to Trash${RST}\n" "$(human "$freed")"
+    printf "  ${DIM}Run again with --apply to move selected items to the Trash.${RST}\n\n"
+  fi
+}
+
+cmd_help() {
+cat <<EOF
+
+${BOLD}mactidy v${VERSION}${RST} — disk + memory analyzer and safe cleaner
+
+${BOLD}USAGE${RST}
+  ./mactidy scan                  Storage report: reclaimable space, big dirs, stale builds
+  ./mactidy mem                   Memory report: pressure, compression, top consumers
+  ./mactidy list                  Show all cleanup categories
+  ./mactidy clean                 Dry run over the ${GRN}safe${RST} tier
+  ./mactidy clean --apply         Move the ${GRN}safe${RST} tier to the Trash
+  ./mactidy clean npm-cache installers --apply
+                                  Clean specific categories (any tier)
+  ./mactidy stale                 Dry run over stale build dirs (node_modules, venv, .next…)
+  ./mactidy stale --apply --days 90
+                                  Move build dirs untouched for 90+ days to the Trash
+  ./mactidy stale --names "node_modules .next" --apply
+                                  Restrict to specific directory names
+
+${BOLD}TIERS${RST}
+  ${GRN}safe${RST}     Regenerated automatically. Costs a re-download or a rebuild.
+  ${YEL}review${RST}   Real data or slow to restore. Never touched unless named explicitly.
+
+${BOLD}SAFETY${RST}
+  • Dry run is the default; ${BOLD}--apply${RST} is required to move anything.
+  • Moving is refused for any path outside \$HOME or on the protected list
+    (\$HOME itself, Documents, Downloads, Desktop, Library, Pictures, Movies, Music, .ssh, Trash).
+  • ${BOLD}--apply${RST} moves items to the Trash; it never permanently deletes them.
+  • Recent moves are kept in a bounded ~/.mactidy/cleanup.log audit log.
+  • ${BOLD}scan${RST} and ${BOLD}mem${RST} are read-only.
+
+EOF
+}
+
+# ─────────────────────────── dispatch ───────────────────────────
+
+args=(); expect_days=0; expect_names=0
+for a in "$@"; do
+  if [ "$expect_days" -eq 1 ]; then STALE_DAYS="$a"; expect_days=0; continue; fi
+  if [ "$expect_names" -eq 1 ]; then STALE_NAMES="$a"; expect_names=0; continue; fi
+  case "$a" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --days) expect_days=1 ;;
+    --days=*) STALE_DAYS="${a#--days=}" ;;
+    --names) expect_names=1 ;;
+    --names=*) STALE_NAMES="${a#--names=}" ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+case "${1:-scan}" in
+  scan)  cmd_scan ;;
+  mem|memory) cmd_mem ;;
+  list)  cmd_list ;;
+  clean) shift 2>/dev/null; cmd_clean "$@" ;;
+  stale) cmd_stale ;;
+  all)   cmd_scan; cmd_mem ;;
+  help|-h|--help) cmd_help ;;
+  *) printf "${RED}Unknown command: %s${RST}\n" "$1"; cmd_help; exit 1 ;;
+esac
