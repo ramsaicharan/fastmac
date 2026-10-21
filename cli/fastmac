@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""fastmac — map every byte on your Mac, then clear it safely. Local, no deps."""
+from __future__ import annotations
+import os, sys, json, time, argparse, subprocess, webbrowser
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fastmac_core as C
+import fastmac_report as R
+import fastmac_mem as M
+
+B, D, RS = "\033[1m", "\033[2m", "\033[0m"
+GR, YE, RD, CY = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
+if not sys.stdout.isatty():
+    B = D = RS = GR = YE = RD = CY = ""
+f = C._fmt
+
+
+def rule(n=64): print(f"{D}{'─' * n}{RS}")
+def head(t): print(f"\n{B}{CY}{t}{RS}"); rule()
+
+
+# ───────────────────────────── scan ─────────────────────────────
+
+def cmd_scan(a):
+    root = a.path or str(C.HOME)
+    head(f"SCAN  {root}")
+    sc = C.Scanner(root, workers=a.workers)
+    tree = sc.run()
+
+    extras = {}
+    extras["age"] = C.age_map(sc.big_files)
+    if not a.no_quick:
+        sys.stderr.write("  totalling quick wins…\r")
+        extras["quick"] = C.quick_wins(root=sc.root, tree=tree)
+        sys.stderr.write(" " * 40 + "\r")
+    if a.dupes:
+        print(f"  {D}matching duplicates by content…{RS}")
+        extras["dupes"] = C.find_duplicates(sc.by_size)
+    if a.apps:
+        sys.stderr.write("  mapping application footprints…\r")
+        extras["apps"] = C.app_footprints(root=sc.root)
+        extras["orphans"] = C.orphan_data(root=sc.root)
+        sys.stderr.write(" " * 44 + "\r")
+
+    name = a.name or time.strftime("%Y-%m-%d_%H%M")
+    path = C.save_scan(name, tree, sc, meta={"extras": list(extras)}, extras=extras)
+    print(f"  snapshot {B}{name}{RS}  {D}{path}{RS}")
+
+    scan = C.load_scan(name)
+    _summary(scan, extras)
+
+    if a.serve:
+        import fastmac_serve as S
+        return S.serve(scan, extras, name)
+
+    if not a.no_ui:
+        out = C.STATE / f"report-{name}.html"
+        out.write_text(R.build(scan, extras))
+        print(f"\n  report  {D}{out}{RS}")
+        webbrowser.open(f"file://{out}")
+        print(f"  {GR}opened in your browser{RS}\n")
+
+
+def _summary(scan, extras):
+    t = scan["totals"]
+    head("TOTALS")
+    print(f"  {f(t['bytes'])} across {t['files']:,} files in {t['dirs']:,} folders"
+          + (f"  {D}({t['errors']:,} unreadable){RS}" if t["errors"] else ""))
+    kids = scan["tree"].get("c", [])[:12]
+    if kids:
+        head("LARGEST")
+        mx = max(k["s"] for k in kids) or 1
+        for k in kids:
+            bar = "█" * int(k["s"] / mx * 22)
+            print(f"  {f(k['s']):>9}  {D}{bar:<22}{RS}  {k['n']}")
+    if extras.get("quick"):
+        head("QUICK WINS")
+        tot = 0
+        for q in extras["quick"][:12]:
+            c = GR if q["tier"] == "safe" else YE
+            print(f"  {f(q['size']):>9}  {c}{q['tier']:<6}{RS}  {q['label']}")
+            tot += q["size"]
+        rule(); print(f"  {B}{f(tot):>9}{RS}  reclaimable")
+    u = extras.get("age", {}).get("untouched", [])
+    if u:
+        head("BIG & UNTOUCHED  (100 MB+, over a year old)")
+        for x in u[:8]:
+            print(f"  {f(x['size']):>9}  {YE}{x['age_days'] / 365:.1f}y{RS}  "
+                  f"{D}{_short(x['path'])}{RS}")
+        rule(); print(f"  {B}{f(sum(x['size'] for x in u)):>9}{RS}  across {len(u)} files")
+    dp = extras.get("dupes", [])
+    if dp:
+        w = sum(g["wasted"] for g in dp)
+        head("DUPLICATES")
+        for g in dp[:6]:
+            print(f"  {f(g['wasted']):>9}  {g['count']}× {f(g['size'])}  "
+                  f"{D}{_short(g['paths'][0])}{RS}")
+        rule(); print(f"  {B}{f(w):>9}{RS}  wasted across {len(dp)} groups")
+
+
+def _short(p, n=58):
+    p = p.replace(str(C.HOME), "~")
+    return p if len(p) <= n else "…" + p[-(n - 1):]
+
+
+# ──────────────────────── other commands ────────────────────────
+
+def _extras_for(scan, want_apps: bool):
+    """Reuse the analysis stored with the scan; only compute what is genuinely missing."""
+    ex = dict(scan.get("extras") or {})
+    if not ex.get("age"):
+        ex["age"] = C.age_map([tuple(b) for b in scan.get("big_files", [])])
+    if "quick" not in ex:
+        sys.stderr.write("  totalling quick wins…\r")
+        ex["quick"] = C.quick_wins(root=scan.get("root"), tree=scan.get("tree"))
+        sys.stderr.write(" " * 40 + "\r")
+    if want_apps and "apps" not in ex:
+        sys.stderr.write("  mapping application footprints…\r")
+        ex["apps"] = C.app_footprints(root=scan.get("root"))
+        ex["orphans"] = C.orphan_data(root=scan.get("root"))
+        sys.stderr.write(" " * 44 + "\r")
+    return ex
+
+
+def cmd_ui(a):
+    rows = C.list_scans()
+    name = a.name or (rows[0][0] if rows else None)
+    if not name:
+        raise SystemExit("no snapshots yet — run: fastmac scan")
+    scan = C.load_scan(name)
+    extras = _extras_for(scan, a.apps)
+    out = C.STATE / f"report-{name}.html"
+    out.write_text(R.build(scan, extras))
+    print(f"  {out}")
+    webbrowser.open(f"file://{out}")
+
+
+def cmd_serve(a):
+    """Serve the report from a local process so the UI can delete and read live RAM."""
+    import fastmac_serve as S
+    rows = C.list_scans()
+    name = a.name or (rows[0][0] if rows else None)
+    if not name:
+        raise SystemExit("no snapshots yet — run: fastmac scan")
+    scan = C.load_scan(name)
+    head(f"SERVE  snapshot '{name}'")
+    extras = _extras_for(scan, a.apps and not a.no_apps)
+    S.serve(scan, extras, name, port=a.port, open_browser=not a.no_open)
+
+
+def cmd_mem(a):
+    m = M.sample()
+    head("MEMORY")
+    print(f"  {'Installed':<18}{f(m['total']):>11}")
+    print(f"  {'App memory':<18}{f(m['app']):>11}")
+    print(f"  {'Wired':<18}{f(m['wired']):>11}")
+    print(f"  {'Compressed':<18}{f(m['compressor']):>11}   {D}holds {f(m['stored'])}{RS}")
+    print(f"  {'Free':<18}{f(m['free']):>11}")
+    rule()
+    print(f"  {B}{'In use':<18}{f(m['used']):>11}{RS}  of {f(m['total'])}")
+    head("PRESSURE")
+    col = {"good": GR, "warn": YE, "bad": RD}[m["level"]]
+    print(f"  {'Compression':<18}{m['ratio']:>10.1f}x")
+    print(f"  {'Swap':<18}{f(m['swap_used']):>11}  of {f(m['swap_total'])}")
+    print(f"  {'Pressure':<18}{col}{m['pressure']:>10.0f}%{RS}")
+    print(f"  {'Verdict':<18}{col}{m['verdict']}{RS}")
+    head("TOP CONSUMERS")
+    for p in M.processes(a.limit):
+        pc = YE if p["procs"] > 20 else D
+        print(f"  {f(p['rss']):>9}  {pc}{p['procs']:>3} proc{RS}  {p['name']}")
+    print(f"\n  {D}live monitor in the browser:  fastmac serve{RS}")
+
+
+def cmd_snapshots(a):
+    rows = C.list_scans()
+    if not rows:
+        return print("  no snapshots yet — run: fastmac scan")
+    head("SNAPSHOTS")
+    for name, s in rows:
+        t = s["totals"]
+        print(f"  {B}{name:<20}{RS} {f(t['bytes']):>9}  {t['files']:>9,} files  "
+              f"{D}{time.strftime('%b %d %H:%M', time.localtime(s['created']))}  {s['root']}{RS}")
+
+
+def cmd_diff(a):
+    d = C.diff_scans(C.load_scan(a.old), C.load_scan(a.new))
+    head(f"DIFF  {a.old} → {a.new}")
+    delta = d["new_bytes"] - d["old_bytes"]
+    sign = "+" if delta > 0 else ""
+    col = RD if delta > 0 else GR
+    print(f"  {f(d['old_bytes'])} → {f(d['new_bytes'])}   {col}{sign}{f(delta)}{RS}")
+    for key, label, c in (("grew", "GREW", RD), ("added", "NEW", YE),
+                          ("shrank", "SHRANK", GR), ("removed", "GONE", GR)):
+        items = d[key]
+        if not items:
+            continue
+        head(label)
+        for x in items[:14]:
+            s = "+" if x["delta"] > 0 else ""
+            print(f"  {c}{s}{f(x['delta']):>9}{RS}  {D}{_short(x['path'])}{RS}")
+
+
+def cmd_dupes(a):
+    head(f"DUPLICATES  {a.path}")
+    sc = C.Scanner(a.path, workers=a.workers)
+    sc.run()
+    groups = C.find_duplicates(sc.by_size)
+    if not groups:
+        return print("  none found")
+    w = sum(g["wasted"] for g in groups)
+    for g in groups[:a.limit]:
+        print(f"\n  {B}{g['count']} copies × {f(g['size'])}{RS}  "
+              f"{YE}{f(g['wasted'])} wasted{RS}")
+        for i, p in enumerate(g["paths"]):
+            print(f"    {GR + 'keep' + RS if i == 0 else D + '  ↳ ' + RS} {_short(p, 70)}")
+    rule(); print(f"  {B}{f(w)}{RS} reclaimable across {len(groups)} groups")
+    print(f"  {D}stage the extras:  fastmac dupes {a.path} --stage{RS}")
+    if a.stage:
+        extra = [p for g in groups for p in g["paths"][1:]]
+        n, refused = C.queue_add(extra, "duplicate")
+        print(f"  {GR}staged {n}{RS}; review with: fastmac queue")
+
+
+def cmd_apps(a):
+    head("APPLICATION FOOTPRINTS")
+    apps = C.app_footprints(root=str(C.HOME))
+    print(f"  {D}{'APPLICATION':<26}{'BUNDLE':>10}{'LEFTOVER':>10}{'TOTAL':>10}  LAST USED{RS}")
+    for ap in apps[:a.limit]:
+        lu = (f"{int((time.time() - ap['last_used']) / 86400)}d ago"
+              if ap["last_used"] else "never")
+        mark = f"{CY}E{RS}" if ap["electron"] else " "
+        old = YE if (not ap["last_used"] or
+                     time.time() - ap["last_used"] > 120 * 86400) else D
+        print(f"  {mark} {ap['name'][:24]:<24}{f(ap['bundle_size']):>10}"
+              f"{f(ap['leftover_size']) if ap['leftover_size'] else '—':>10}"
+              f"{B}{f(ap['total']):>10}{RS}  {old}{lu}{RS}")
+    orph = C.orphan_data(root=str(C.HOME))
+    if orph:
+        head("ORPHANED — the app is gone, its data stayed")
+        for o in orph:
+            print(f"  {f(o['size']):>9}  {D}{_short(o['path'])}{RS}")
+        rule(); print(f"  {B}{f(sum(o['size'] for o in orph))}{RS} reclaimable")
+    print(f"\n  {D}E = bundles its own copy of Chromium (Electron){RS}")
+    print(f"  {D}uninstall completely:  fastmac uninstall \"App Name\"{RS}")
+
+
+def cmd_uninstall(a):
+    apps = {ap["name"].lower(): ap for ap in C.app_footprints(root=str(C.HOME))}
+    ap = apps.get(a.name.lower())
+    if not ap:
+        matches = [n for n in apps if a.name.lower() in n]
+        raise SystemExit(f"no app named '{a.name}'" +
+                         (f". did you mean: {', '.join(matches[:5])}" if matches else ""))
+    head(f"UNINSTALL COMPLETELY — {ap['name']}")
+    print(f"  {f(ap['bundle_size']):>9}  {ap['path']}")
+    for l in ap["leftovers"]:
+        print(f"  {f(l['size']):>9}  {D}{_short(l['path'])}{RS}")
+    rule(); print(f"  {B}{f(ap['total']):>9}{RS}  total footprint")
+    n, refused = C.queue_add([ap["path"]] + [l["path"] for l in ap["leftovers"]],
+                             f"uninstall {ap['name']}")
+    for p, why in refused:
+        print(f"  {RD}refused{RS} {_short(p)} — {why}")
+    print(f"\n  {GR}{n} items staged.{RS} Nothing removed yet.")
+    print(f"  {D}review: fastmac queue     apply: fastmac purge --apply{RS}")
+
+
+def cmd_builds(a):
+    head(f"BUILD ARTIFACTS  (untouched {a.age}+ days)")
+    roots = a.paths or [str(C.HOME / "Documents"), str(C.HOME / "Downloads"),
+                        str(C.HOME / "Desktop")]
+    found = C.find_build_dirs(roots, a.age)
+    if not found:
+        return print("  none found")
+    for x in found[:a.limit]:
+        print(f"  {f(x['size']):>9}  {D}{x['age_days']:>4}d{RS}  {_short(x['path'])}")
+    rule(); print(f"  {B}{f(sum(x['size'] for x in found))}{RS} across {len(found)} directories")
+    if a.stage:
+        n, _ = C.queue_add([x["path"] for x in found], f"build artifact {a.age}d+")
+        print(f"  {GR}staged {n}{RS}; review with: fastmac queue")
+    else:
+        print(f"  {D}stage them:  fastmac builds --age {a.age} --stage{RS}")
+
+
+def cmd_inspect(a):
+    i = C.inspect(a.path)
+    head(f"INSPECT  {i['path']}")
+    print(f"  {'Size on disk':<20}{f(i['disk']):>12}")
+    print(f"  {'Logical size':<20}{f(i['logical']):>12}")
+    if i["compression_saved"]:
+        print(f"  {'Sparse + compressed':<20}{GR}{f(i['compression_saved']):>12}{RS}"
+              f"  {D}({i['compression_pct']:.0f}%){RS}")
+    print(f"  {'Files':<20}{i['files']:>12,}")
+    print(f"  {'Folders':<20}{i['dirs']:>12,}")
+    print(f"  {'Share of parent':<20}{i['share_of_parent']:>11.1f}%")
+    print(f"  {'Created':<20}{time.strftime('%Y-%m-%d', time.localtime(i['created'])):>12}")
+    print(f"  {'Modified':<20}{time.strftime('%Y-%m-%d', time.localtime(i['modified'])):>12}")
+    if i["largest"]:
+        head("LARGEST INSIDE")
+        for k in i["largest"]:
+            print(f"  {f(k['size']):>9}  {CY if k['is_dir'] else D}"
+                  f"{'▸' if k['is_dir'] else '·'}{RS} {k['name']}")
+
+
+def cmd_stage(a):
+    n, refused = C.queue_add(a.paths, a.reason)
+    for p, why in refused:
+        print(f"  {RD}refused{RS} {_short(p)} — {why}")
+    print(f"  {GR}staged {n}{RS}   queue: fastmac queue")
+
+
+def cmd_queue(a):
+    items = C.queue_load()
+    if not items:
+        return print("  queue is empty")
+    head("CLEANUP QUEUE")
+    for i, it in enumerate(items):
+        size = it.get("allocated", it.get("size", 0))
+        print(f"  {D}{i:>3}{RS} {f(size):>9}  {_short(it.get('path', ''), 52)}"
+              + (f"  {D}{it.get('reason', '')}{RS}" if it.get("reason") else ""))
+    rule()
+    print(f"  {B}{f(sum(i.get('allocated', i.get('size', 0)) for i in items))}{RS}"
+          f" staged across {len(items)} items")
+    print(f"\n  {D}dry run:  fastmac purge{RS}")
+    print(f"  {D}apply:    fastmac purge --apply          (moves to Trash){RS}")
+    print(f"  {D}          moved items remain recoverable in the Trash{RS}")
+
+
+def cmd_unstage(a):
+    items = C.queue_load()
+    if a.all:
+        removed = C.queue_remove()
+        return print(f"  cleared {removed} items")
+    removed = C.queue_remove(
+        [it.get("path", "") for i, it in enumerate(items)
+         if str(i) in a.which or it.get("path") in a.which])
+    print(f"  removed {removed} from queue")
+
+
+def cmd_purge(a):
+    if a.hard:
+        raise SystemExit("permanent deletion is disabled; use 'fastmac purge --apply' to move items to the Trash")
+    items = C.queue_load()
+    if not items:
+        return print("  queue is empty")
+    mode = "move to Trash"
+    if a.apply:
+        print(f"\n{B}{RD}APPLY — {len(items)} items will {mode}.{RS}")
+    else:
+        print(f"\n{B}DRY RUN{RS} {D}— nothing removed. Add --apply.{RS}")
+    head("STAGED")
+    for it in items:
+        ok, why = C.is_safe_to_delete(it.get("path", ""))
+        tag = f"{GR}ok{RS}     " if ok else f"{RD}refused{RS}"
+        print(f"  {tag} {f(it.get('allocated', it.get('size', 0))):>9}  {_short(it.get('path', ''), 50)}"
+              + ("" if ok else f"  {RD}{why}{RS}"))
+    done, freed, failed = C.queue_purge(apply=a.apply, use_trash=True)
+    rule()
+    if a.apply:
+        print(f"  {B}{GR}{f(freed)} moved{RS} across {done} items"
+              + f"  {D}(to Trash; empty Trash to reclaim disk space){RS}")
+        print(f"  {D}still recoverable from the Trash until you empty it{RS}")
+        for p, why in failed:
+            print(f"  {RD}failed{RS} {_short(p)} — {why}")
+        print(f"  {D}log: {C.LOGF}{RS}")
+    else:
+        print(f"  {B}would move {f(freed)}{RS} to Trash across {done} items")
+
+
+def cmd_watch(a):
+    """Live monitor: re-reads free space and reports what moved."""
+    head(f"LIVE MONITOR  {a.path}  {D}(ctrl-c to stop){RS}")
+    prev = None
+    try:
+        while True:
+            st = os.statvfs(a.path)
+            free = st.f_bavail * st.f_frsize
+            used = (st.f_blocks - st.f_bavail) * st.f_frsize
+            delta = "" if prev is None else (
+                f"  {RD}+{f(prev - free)}{RS}" if free < prev else
+                f"  {GR}-{f(free - prev)}{RS}" if free > prev else f"  {D}—{RS}")
+            print(f"  {time.strftime('%H:%M:%S')}   free {B}{f(free):>10}{RS}"
+                  f"   used {f(used):>10}{delta}")
+            prev = free
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        print("\n  stopped")
+
+
+# ───────────────────────────── cli ─────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="fastmac",
+        description="Map every byte on your Mac, then clear it safely. Runs entirely locally.")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("scan", help="scan a path and open the visual report")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--name"); s.add_argument("--workers", type=int, default=16)
+    s.add_argument("--dupes", action="store_true", help="also match duplicates by content")
+    s.add_argument("--apps", action="store_true", help="also map application footprints")
+    s.add_argument("--no-ui", action="store_true"); s.add_argument("--no-quick", action="store_true")
+    s.add_argument("--serve", action="store_true", help="open live instead of a static report")
+    s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("ui", help="rebuild and open the report for a snapshot")
+    s.add_argument("name", nargs="?"); s.add_argument("--apps", action="store_true")
+    s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("serve", help="serve the report live — delete from the UI, watch RAM")
+    s.add_argument("name", nargs="?"); s.add_argument("--port", type=int, default=0)
+    s.add_argument("--no-open", action="store_true"); s.add_argument("--apps", action="store_true",
+                    help="also map application footprints (slower; opt-in)")
+    s.add_argument("--no-apps", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("mem", help="memory report")
+    s.add_argument("--limit", type=int, default=12); s.set_defaults(fn=cmd_mem)
+
+    sub.add_parser("snapshots", help="list saved scans").set_defaults(fn=cmd_snapshots)
+
+    s = sub.add_parser("diff", help="compare two snapshots")
+    s.add_argument("old"); s.add_argument("new"); s.set_defaults(fn=cmd_diff)
+
+    s = sub.add_parser("dupes", help="find duplicate files by content")
+    s.add_argument("path", nargs="?", default=str(C.HOME))
+    s.add_argument("--limit", type=int, default=25); s.add_argument("--workers", type=int, default=16)
+    s.add_argument("--stage", action="store_true"); s.set_defaults(fn=cmd_dupes)
+
+    s = sub.add_parser("apps", help="application footprints and orphaned data")
+    s.add_argument("--limit", type=int, default=40); s.set_defaults(fn=cmd_apps)
+
+    s = sub.add_parser("uninstall", help="stage an app and everything it scattered")
+    s.add_argument("name"); s.set_defaults(fn=cmd_uninstall)
+
+    s = sub.add_parser("builds", help="find stale build artifacts")
+    s.add_argument("paths", nargs="*"); s.add_argument("--age", type=int, default=60)
+    s.add_argument("--limit", type=int, default=40); s.add_argument("--stage", action="store_true")
+    s.set_defaults(fn=cmd_builds)
+
+    s = sub.add_parser("inspect", help="detailed breakdown of one path")
+    s.add_argument("path"); s.set_defaults(fn=cmd_inspect)
+
+    s = sub.add_parser("stage", help="add paths to the cleanup queue")
+    s.add_argument("paths", nargs="+"); s.add_argument("--reason", default="")
+    s.set_defaults(fn=cmd_stage)
+
+    sub.add_parser("queue", help="review the cleanup queue").set_defaults(fn=cmd_queue)
+
+    s = sub.add_parser("unstage", help="remove items from the queue")
+    s.add_argument("which", nargs="*"); s.add_argument("--all", action="store_true")
+    s.set_defaults(fn=cmd_unstage)
+
+    s = sub.add_parser("purge", help="apply the cleanup queue")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--hard", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_purge)
+
+    s = sub.add_parser("watch", help="live free-space monitor")
+    s.add_argument("path", nargs="?", default="/System/Volumes/Data")
+    s.add_argument("--interval", type=float, default=3.0); s.set_defaults(fn=cmd_watch)
+
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help(); return
+    try:
+        a.fn(a)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  interrupted")
+        sys.exit(130)

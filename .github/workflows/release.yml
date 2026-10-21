@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check
+        run: |
+          swift build -c release
+          "$(swift build -c release --show-bin-path)/FastMac" --checkall
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          FASTMAC_VERSION="$VERSION" FASTMAC_BUILD="${{ github.run_number }}" scripts/bundle.sh release
+          mkdir -p dist
+          ditto -c -k --keepParent build/FastMac.app "dist/FastMac-$VERSION.zip"
+          (cd dist && shasum -a 256 "FastMac-$VERSION.zip" > "FastMac-$VERSION.zip.sha256")
+
+      - name: Release notes
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## " v "( |$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "### Install"
+            echo "Unzip, move **FastMac.app** to Applications and open it. This build isn't notarized:"
+            echo "if macOS blocks it, open **System Settings → Privacy & Security** and click **Open Anyway**."
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 "dist/FastMac-$VERSION.zip.sha256")\`"
+          } >> notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "FastMac $VERSION" --notes-file notes.md --verify-tag

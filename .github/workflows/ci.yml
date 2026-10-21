@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: Build and check the app
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Feature checks
+        run: |
+          BIN="$(swift build -c release --show-bin-path)/FastMac"
+          "$BIN" --checkall
+          "$BIN" --navigation-check
+          "$BIN" --render-check
+
+      - name: Render checks
+        run: |
+          BIN="$(swift build -c release --show-bin-path)/FastMac"
+          OUT="$RUNNER_TEMP/renders"
+          "$BIN" --health-render-check "$OUT/health"
+          "$BIN" --quick-actions-render-check "$OUT/quick-actions"
+          "$BIN" --feature-render-check "$OUT/features"
+          "$BIN" --menu-check "$OUT/menu"
+
+      - name: Upload renders for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renders
+          path: ${{ runner.temp }}/renders
+          if-no-files-found: ignore
+
+      - name: Package
+        run: scripts/bundle.sh release
+
+  cli:
+    name: Command-line tools
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        working-directory: cli
+        run: python3 -m unittest test_fastmac
+      - name: Shell syntax
+        run: bash -n cli/mactidy
