@@ -11,7 +11,11 @@ jobs:
   release:
     name: Build and publish
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      # Signing and notarization run only when these repository secrets exist.
+      # Without them the release is ad-hoc signed and users see "Open Anyway".
+      CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.APPLE_API_KEY_P8 != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -20,11 +24,48 @@ jobs:
           swift build -c release
           "$(swift build -c release --show-bin-path)/FastMac" --checkall
 
+      - name: Import Developer ID certificate
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/fastmac.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk '/Developer ID Application/ { print $2; exit }')"
+          [ -n "$IDENTITY" ] || { echo "No Developer ID Application identity in the certificate"; exit 1; }
+          echo "FASTMAC_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
       - name: Package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           FASTMAC_VERSION="$VERSION" FASTMAC_BUILD="${{ github.run_number }}" scripts/bundle.sh release
+
+      - name: Notarize
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+          scripts/notarize.sh
+          rm "$APPLE_API_KEY_PATH"
+
+      - name: Zip
+        run: |
           mkdir -p dist
           ditto -c -k --keepParent build/FastMac.app "dist/FastMac-$VERSION.zip"
           (cd dist && shasum -a 256 "FastMac-$VERSION.zip" > "FastMac-$VERSION.zip.sha256")
@@ -39,8 +80,12 @@ jobs:
           {
             echo
             echo "### Install"
-            echo "Unzip, move **FastMac.app** to Applications and open it. This build isn't notarized:"
-            echo "if macOS blocks it, open **System Settings → Privacy & Security** and click **Open Anyway**."
+            if [ "$CAN_NOTARIZE" = "true" ]; then
+              echo "Unzip, move **FastMac.app** to Applications and open it. This build is signed and notarized by Apple."
+            else
+              echo "Unzip, move **FastMac.app** to Applications and open it. This build isn't notarized:"
+              echo "if macOS blocks it, open **System Settings → Privacy & Security** and click **Open Anyway**."
+            fi
             echo
             echo "SHA-256: \`$(cut -d' ' -f1 "dist/FastMac-$VERSION.zip.sha256")\`"
           } >> notes.md
@@ -51,3 +96,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "FastMac $VERSION" --notes-file notes.md --verify-tag
+
+      - name: Remove temporary keychain
+        if: always() && env.CAN_NOTARIZE == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/fastmac.keychain-db" || true

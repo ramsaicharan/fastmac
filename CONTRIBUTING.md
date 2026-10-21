@@ -106,7 +106,8 @@ This renders Retina images from fixture data. Copy the ones you need into `docs/
 1. Update `CHANGELOG.md` and the default `FASTMAC_VERSION` in `scripts/bundle.sh`.
 2. Tag the commit: `git tag v2.1.0 && git push origin v2.1.0`.
 3. The release workflow builds `FastMac-2.1.0.zip`, publishes its SHA-256 and creates the
-   GitHub release.
+   GitHub release. With the signing secrets configured it also signs with Developer ID and
+   notarizes the app; see [docs/releasing.md](docs/releasing.md).
 
 ## License
 

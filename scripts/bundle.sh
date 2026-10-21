@@ -136,7 +136,12 @@ plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$BUNDLE/Contents/Info.p
 
 # Default local builds are ad-hoc. Set FASTMAC_SIGNING_IDENTITY to keep using an
 # existing certificate identity across builds. Notarization is a separate step.
-codesign --force --sign "$SIGNING_IDENTITY" --identifier app.fastmac.FastMac "$BUNDLE"
+# The hardened runtime is required for notarization, so every build uses it; testing
+# ad-hoc builds this way catches anything it would block. A real certificate also
+# needs Apple's secure timestamp.
+SIGN_FLAGS=(--force --options runtime --identifier app.fastmac.FastMac)
+if [ "$SIGNING_IDENTITY" != "-" ]; then SIGN_FLAGS+=(--timestamp); fi
+codesign "${SIGN_FLAGS[@]}" --sign "$SIGNING_IDENTITY" "$BUNDLE"
 codesign --verify --deep --strict "$BUNDLE"
 plutil -lint "$BUNDLE/Contents/Info.plist"
 # Replace only the generated app after a successful build and signature check.
