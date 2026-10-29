@@ -148,6 +148,41 @@ if args.count >= 2, args[1] == "--activity-trends-check" { runChecks("ACTIVITY T
 if args.count >= 2, args[1] == "--activity-alert-check" { runChecks("ACTIVITY ALERTS", ActivityAlertSelfCheck.run()) }
 if args.count >= 2, args[1] == "--resource-check" { runChecks("RESOURCES", ResourceSelfCheck.run()) }
 if args.count >= 2, args[1] == "--advanced-check" { runChecks("ADVANCED TOOLS", AdvancedResourcesSelfCheck.run()) }
+// One synchronous pass of every storage-watch tier against this Mac, with timings.
+// Read-only: it prints findings and persists nothing.
+if args.count >= 2, args[1] == "--storage-watch-now" {
+    func ms(_ start: Date) -> String { String(format: "%.0f ms", Date().timeIntervalSince(start) * 1000) }
+    var t = Date()
+    let disk = MemoryProbe.diskFree()
+    let temp = TempBrowserProfiles.read()
+    print("  frequent tier: \(ms(t))  (temp folder: \(temp.idle.count) idle, \(temp.active) in use)")
+    t = Date()
+    var caches: [String: CacheReading] = [:]
+    for cache in WatchedCache.all {
+        let paths = cache.absolutePaths.filter { FileManager.default.fileExists(atPath: $0) }
+        guard !paths.isEmpty else { continue }
+        caches[cache.id] = CacheReading(bytes: paths.reduce(Int64(0)) { $0 + Analysis.sizeOf($1) }, previous: nil)
+    }
+    print("  daily caches:  \(ms(t))  (\(caches.count) present)")
+    t = Date()
+    let apps = DormantApps.inventory(previous: [:])
+    print("  daily apps:    \(ms(t))  (\(apps.count) apps, first pass — later passes reuse unchanged sizes)")
+    let history = History.loadAll()
+    MainActor.assumeIsolated {
+        let watch = StorageWatch(persists: false, startsTimers: false)
+        let sample = HealthProbe.sample()
+        watch.diskStatus = { sample.storageStatus }
+        watch.seed(temp: temp, caches: caches, apps: apps, history: history, free: disk.free)
+        print("\n  \(watch.findings.count) finding(s) · \(watch.popupFindings.count) for the popup · disk \(sample.storageStatus.rawValue)")
+        for f in watch.findings {
+            print("    [\(f.urgency.rawValue)] \(f.title)\(f.sizeText.map { " — " + $0 } ?? "")")
+            print("        \(f.detail)")
+            if let b = f.blockedReason { print("        blocked: \(b)") }
+        }
+    }
+    exit(0)
+}
+if args.count >= 2, args[1] == "--storage-watch-check" { runChecks("STORAGE WATCH", StorageWatchSelfCheck.run()) }
 if args.count >= 2, args[1] == "--activity-export-check" { runChecks("ACTIVITY EXPORT", ActivityExportSelfCheck.run()) }
 if args.count >= 2, args[1] == "--activity-monitor-check" {
     let application = NSApplication.shared
@@ -194,6 +229,7 @@ if args.count >= 2, args[1] == "--checkall" {
     all += ResourceSelfCheck.run()
     all += AdvancedResourcesSelfCheck.run()
     all += ActivityExportSelfCheck.run()
+    all += StorageWatchSelfCheck.run()
     runChecks("ALL FEATURE CHECKS", all)
 }
 

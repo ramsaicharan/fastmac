@@ -463,6 +463,20 @@ final class AlertManager: ObservableObject {
         }
     }
 
+    /// Storage findings arrive already edge-triggered from StorageWatch. Returns whether
+    /// delivery was attempted, so a refusal — alerts off, no permission, snoozed, or still
+    /// cooling down — leaves the rise for later instead of silently using it up.
+    @discardableResult
+    func notifyStorage(_ finding: StorageFinding, now: Date = Date()) -> Bool {
+        guard enabled, authorized, !AlertSnoozePolicy.isActive(until: snoozedUntil, now: now) else { return false }
+        let key = "storage.\(finding.id)"
+        if let last = cooldowns[key], now.timeIntervalSince(last) < 12 * 3_600 { return false }
+        let size = finding.sizeText.map { " (\($0))" } ?? ""
+        deliver(key: key, title: finding.title + size, body: finding.detail + " Nothing is removed until you choose to.",
+                systemCondition: nil, appCandidate: nil)
+        return true
+    }
+
     private func deliver(key: String, title: String, body: String,
                          systemCondition: AlertEvaluator.Condition?, appCandidate: ActivityAlertCandidate?) {
         guard enabled, authorized, !AlertSnoozePolicy.isActive(until: snoozedUntil), !pending.contains(key) else { return }

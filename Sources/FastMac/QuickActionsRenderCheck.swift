@@ -45,17 +45,17 @@ enum QuickActionsRenderCheck {
                 cpu: nil, memory: nil, response: .unavailable)
         ]
 
-        func healthSample(at: Date, pressure: HealthMemoryPressure = .normal) -> HealthSample {
+        func healthSample(at: Date, pressure: HealthMemoryPressure = .normal, diskFree: Int64 = 128 * 1_073_741_824) -> HealthSample {
             HealthSample(memory: MemorySample(total: 16 * gib, app: 10 * gib, wired: 2 * gib,
                 compressor: 2 * gib, free: 2 * gib, fileBacked: 3 * gib, purgeable: 300 * mib,
                 swapUsed: 3 * gib, swapTotal: 4 * gib, at: at), memoryPressure: pressure,
-                diskFree: 128 * gib, diskTotal: 512 * gib, thermalState: .nominal, sampledAt: at)
+                diskFree: diskFree, diskTotal: 512 * gib, thermalState: .nominal, sampledAt: at)
         }
 
-        func activitySample(at: Date, apps: [QuickActionApp]) -> ActivitySnapshot {
+        func activitySample(at: Date, apps: [QuickActionApp], diskFree: Int64 = 128 * 1_073_741_824) -> ActivitySnapshot {
             ActivitySnapshot(sampledAt: at, sessionID: "quick-actions-render-fixture",
                 cpuPercent: 24, memoryUsed: 14 * gib, memoryTotal: 16 * gib,
-                swapUsed: 3 * gib, memoryPressure: "normal", diskFree: 128 * gib,
+                swapUsed: 3 * gib, memoryPressure: "normal", diskFree: diskFree,
                 diskTotal: 512 * gib, diskReadRate: 500_000, diskWriteRate: 120_000,
                 networkDownloadRate: 1_400_000, networkUploadRate: 96_000,
                 networkScope: "Fixture interface", batteryPercent: 78, gpuPercent: nil,
@@ -83,7 +83,36 @@ enum QuickActionsRenderCheck {
                 initialHistory: fixture.activity.map { [$0] } ?? [])
             let model = QuickActionsModel(apps: fixture.apps, fixtureMode: true)
             // The closures deliberately have no effects, including navigation.
-            let popup = QuickActionsPopover(health: health, activity: activity, model: model,
+            let popup = QuickActionsPopover(health: health, activity: activity, model: model, storage: .inert,
+                onNavigate: { _ in }, onSettings: {}, onRefresh: {})
+            for dark in [false, true] {
+                let name = "quick-actions-\(fixture.name)-\(dark ? "dark" : "light")"
+                lines.append(contentsOf: render(name: name, content: popup.snapshotContent,
+                    dark: dark, directory: directory, scale: scale))
+            }
+        }
+
+        // Storage watch cards, built by the production policy from fixture readings.
+        var leak = FreeSpaceTrend()
+        for h in stride(from: 72, through: 0, by: -1) {
+            leak.record(free: 10 * gib + Int64(Double(h) / 24 * 7 * Double(gib)), at: now.addingTimeInterval(-Double(h) * 3_600))
+        }
+        let storageFixtures: [(name: String, findings: [StorageFinding], message: String?)] = [
+            ("storage", [StorageWatchPolicy.filling(trend: leak, free: 10 * gib, now: now),
+                         StorageWatchPolicy.tempProfiles(.init(idle: (0..<474).map { "fixture-\($0)" }, active: 7,
+                                                               bytes: 21 * gib, estimated: true))].compactMap { $0 }, nil),
+            ("storage-blocked", [StorageWatchPolicy.cache(WatchedCache.all[0], reading: CacheReading(bytes: 6 * gib, previous: 3 * gib),
+                                                          blocked: "Quit Google Chrome first.")].compactMap { $0 },
+             "Moved 474 profiles (\(fmt(21 * gib))) to the Trash. Empty the Trash to get the space back."),
+        ]
+        for fixture in storageFixtures {
+            let health = HealthMonitor(fixtureSample: healthSample(at: now, diskFree: 10 * gib), isMonitoring: true)
+            let activity = ActivityMonitor(allowsPersistence: false, initialHistory: [activitySample(at: now, apps: apps, diskFree: 10 * gib)])
+            let model = QuickActionsModel(apps: apps, fixtureMode: true)
+            let storage = StorageWatch(persists: false, startsTimers: false)
+            storage.seed(findings: fixture.findings, message: fixture.message)
+            lines.append("\(storage.popupFindings.count == fixture.findings.count ? "PASS" : "FAIL") quick actions \(fixture.name): every attention finding reaches the popup")
+            let popup = QuickActionsPopover(health: health, activity: activity, model: model, storage: storage,
                 onNavigate: { _ in }, onSettings: {}, onRefresh: {})
             for dark in [false, true] {
                 let name = "quick-actions-\(fixture.name)-\(dark ? "dark" : "light")"

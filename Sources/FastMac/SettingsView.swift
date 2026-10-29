@@ -54,6 +54,14 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Watch storage for leaks and growing caches", isOn: $settings.storageWatchEnabled)
+            } header: { Text("Storage watch") }
+            footer: {
+                Text("Every 30 minutes FastMac notes your free space and lists the top level of your temp folder, without measuring sizes. About once a day, at low priority, it measures a short fixed list of cache folders and checks which large apps you haven’t opened in months. It never scans your documents and never removes anything on its own — fixes in the menu bar move items to the Trash after you confirm.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Record local activity history", isOn: $settings.recordActivityHistory)
                 Picker("Keep recordings", selection: $settings.activityRetentionDays) {
                     Text("1 day").tag(1); Text("7 days").tag(7); Text("30 days").tag(30)
@@ -76,7 +84,7 @@ struct SettingsView: View {
                 if let error = alerts.error { Text(error).font(.caption).foregroundStyle(.secondary) }
             } header: { Text("Notifications") }
             footer: {
-                Text("Optional alerts use macOS memory pressure, low storage and sustained app activity. Monitoring must be enabled. Notifications never quit apps or remove files.")
+                Text("Optional alerts use macOS memory pressure, low storage, storage filling quickly, leftover browser test profiles, fast-growing caches and sustained app activity. Monitoring must be enabled. Notifications never quit apps or remove files.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

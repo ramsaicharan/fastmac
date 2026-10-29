@@ -8,11 +8,13 @@ struct QuickActionsPopover: View {
     @ObservedObject var health: HealthMonitor
     @ObservedObject var activity: ActivityMonitor
     @ObservedObject var model: QuickActionsModel
+    @ObservedObject var storage: StorageWatch
     let onNavigate: (ViewKind) -> Void
     let onSettings: () -> Void
     let onRefresh: () -> Void
     @State private var sort: AppSort = .memory
     @State private var pending: PendingQuit?
+    @State private var pendingStorage: StorageFinding?
     @Namespace private var sortSelection
 
     fileprivate enum AppSort: String, CaseIterable { case memory = "Memory", cpu = "CPU" }
@@ -46,6 +48,7 @@ struct QuickActionsPopover: View {
             header
             metrics
             if let notice { noticeBanner(notice) }
+            if !storage.popupFindings.isEmpty || storage.message != nil { storageSection }
             appHeading
             if scrollApps {
                 ScrollView { appList(orderedApps) }
@@ -62,10 +65,13 @@ struct QuickActionsPopover: View {
         .frame(maxWidth: .infinity)
         .frame(maxHeight: .infinity, alignment: .top)
         .foregroundStyle(.primary)
-        .disabled(pending != nil)
-        .accessibilityHidden(pending != nil)
-        .overlay { if let pending { confirmation(pending).transition(.opacity) } }
-        .animation(DS.Motion.quick, value: pending == nil)
+        .disabled(pending != nil || pendingStorage != nil)
+        .accessibilityHidden(pending != nil || pendingStorage != nil)
+        .overlay {
+            if let pending { confirmation(pending).transition(.opacity) }
+            else if let pendingStorage { storageConfirmation(pendingStorage).transition(.opacity) }
+        }
+        .animation(DS.Motion.quick, value: pending == nil && pendingStorage == nil)
     }
 
     // MARK: Header
@@ -173,6 +179,59 @@ struct QuickActionsPopover: View {
         .font(.dsCaption)
         .padding(.horizontal, DS.Space.sm - 2).padding(.vertical, DS.Space.xs)
         .background(notice.color.opacity(0.12), in: RoundedRectangle(cornerRadius: DS.Radius.sm, style: .continuous))
+    }
+
+    // MARK: Storage
+
+    /// Only findings that deserve attention reach here — at most two, worst first — so a
+    /// healthy Mac keeps a quiet popup. Each card states its evidence and its risk.
+    private var storageSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            if let message = storage.message {
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.xs) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(DS.Palette.accent)
+                    Text(message).foregroundStyle(.primary.opacity(0.85)).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button { storage.message = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(DSIconButtonStyle())
+                        .help("Dismiss").accessibilityLabel("Dismiss")
+                }
+                .font(.dsCaption)
+                .padding(.horizontal, DS.Space.sm - 2).padding(.vertical, DS.Space.xs)
+                .background(DS.Palette.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: DS.Radius.sm, style: .continuous))
+            }
+            ForEach(storage.popupFindings) { finding in
+                StorageCard(finding: finding, working: storage.working == finding.id) {
+                    if case .open(let view) = finding.action { onNavigate(view) }
+                    else { pendingStorage = finding }
+                }
+            }
+        }
+    }
+
+    private func storageConfirmation(_ finding: StorageFinding) -> some View {
+        ZStack {
+            DS.Palette.canvas.opacity(0.97)
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                IconPlate(symbol: "trash", tint: accent, size: 44)
+                Text(finding.title + (finding.sizeText.map { " — \($0)" } ?? ""))
+                    .font(.dsTitle).fixedSize(horizontal: false, vertical: true)
+                Text(finding.detail).font(.dsBody).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                RiskDetail(note: finding.note)
+                HStack {
+                    Button("Cancel") { pendingStorage = nil }.keyboardShortcut(.defaultAction)
+                    Spacer()
+                    Button(finding.actionTitle) {
+                        pendingStorage = nil
+                        storage.perform(finding)
+                    }
+                }
+                .controlSize(.large).padding(.top, DS.Space.xs)
+            }
+            .padding(DS.Space.xl - 4)
+        }
+        .accessibilityAddTraits(.isModal).onExitCommand { pendingStorage = nil }
     }
 
     // MARK: Apps
@@ -416,5 +475,59 @@ private struct QuickAppRow: View {
             + (app.response == .unchecked ? "" : ", \(app.response.label)"))
         .accessibilityAction(named: "Quit \(app.name)") { if !disabled { onQuit() } }
         .accessibilityAction(named: "Force Quit \(app.name)") { if !disabled { onForceQuit() } }
+    }
+}
+
+/// One storage finding: what it is, how big, the evidence, its risk, and one action.
+private struct StorageCard: View {
+    let finding: StorageFinding
+    let working: Bool
+    let onAct: () -> Void
+
+    private var symbol: String {
+        switch finding.kind {
+        case .filling: "chart.line.downtrend.xyaxis"
+        case .tempProfiles: "globe"
+        case .cache: "archivebox"
+        case .dormantApps: "app.dashed"
+        case .staleScan: "clock.arrow.circlepath"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: DS.Space.xs) {
+            Image(systemName: symbol).foregroundStyle(finding.urgency.color)
+                .frame(width: 16).padding(.top, 1).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(finding.title).font(.dsCaptionEmphasis).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if let size = finding.sizeText {
+                        Text(size).font(.dsCaptionEmphasis).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+                Text(finding.detail).font(.dsCaption).foregroundStyle(.secondary)
+                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                    .help(finding.detail)
+                HStack(spacing: 6) {
+                    // The badge describes the action. Opening a screen carries no risk, and
+                    // beside a warning a green "Safe" would read as a verdict on the problem.
+                    if finding.isOneClick { RiskBadge(risk: finding.note.risk, note: finding.note) }
+                    if let blocked = finding.blockedReason {
+                        Text(blocked).font(.dsCaption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    Button(working ? "Working…" : finding.actionTitle, action: onAct)
+                        .buttonStyle(DSButtonStyle(kind: .secondary, compact: true))
+                        .disabled(working || finding.blockedReason != nil)
+                }
+            }
+        }
+        .padding(DS.Space.xs + 2)
+        .background(finding.urgency.color.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: DS.Radius.sm, style: .continuous))
+        // .contain, not .combine: combining would fold the action button into one spoken
+        // label and leave nothing a VoiceOver user could press.
+        .accessibilityElement(children: .contain)
     }
 }

@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let health = HealthMonitor()
     let aiStorage = AIStorageService()
     let activity = ActivityMonitor(allowsPersistence: !CommandLine.arguments.contains("--app-smoke"))
+    /// Smoke runs exercise the real lifecycle but must not read or write the user's state.
+    let storage = CommandLine.arguments.contains("--app-smoke") ? StorageWatch.inert : StorageWatch()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppMenu.install()
@@ -46,11 +48,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             AlertManager.shared.configure(health: self.health, activity: self.activity,
                 enabled: enabled && self.health.isMonitoring && !CommandLine.arguments.contains("--app-smoke"))
         }.store(in: &subscriptions)
+        storage.diskStatus = { [weak self] in self?.health.sample?.storageStatus ?? .unknown }
+        storage.onRise = { AlertManager.shared.notifyStorage($0) }
+        Settings.shared.$storageWatchEnabled.sink { [weak self] enabled in
+            guard let self else { return }
+            if enabled { self.storage.start() } else { self.storage.stop() }
+        }.store(in: &subscriptions)
         Settings.shared.$activityRetentionDays.sink { [weak self] days in
             self?.activity.applyRetention(days: days)
         }.store(in: &subscriptions)
 
-        menuBar = MenuBarController(health: health, store: store, activity: activity,
+        menuBar = MenuBarController(health: health, store: store, activity: activity, storage: storage,
             onNavigate: { [weak self] view in self?.showDashboard(view: view) },
             onScanHome: { [weak self] in
                 self?.showDashboard(view: .folders)
@@ -188,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         aiStorage.cancel()
         health.stop()
         activity.stop()
+        storage.stop()
         AlertManager.shared.stop()
         menuBar?.shutdown()
     }

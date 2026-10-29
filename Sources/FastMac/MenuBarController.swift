@@ -100,6 +100,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var subscriptions: Set<AnyCancellable> = []
     private var defaultsObserver: NSObjectProtocol?
     private let health: HealthMonitor
+    private let storage: StorageWatch
     private let store: AppStore
     private let activity: ActivityMonitor
     private let header = HealthMenuHeader()
@@ -121,12 +122,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     var isInstalled: Bool { statusItem != nil }
     var lastTickCost: TimeInterval { health.lastProbeMilliseconds / 1000 }
 
-    init(health: HealthMonitor, store: AppStore, activity: ActivityMonitor? = nil,
+    init(health: HealthMonitor, store: AppStore, activity: ActivityMonitor? = nil, storage: StorageWatch,
          onNavigate: @escaping (ViewKind) -> Void,
          onScanHome: @escaping () -> Void,
          onSettings: @escaping () -> Void,
          onUnavailable: @escaping () -> Void) {
         self.health = health
+        self.storage = storage
         self.store = store
         self.activity = activity ?? ActivityMonitor(allowsPersistence: false)
         self.onNavigate = onNavigate
@@ -362,7 +364,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                                                            anchor: anchor, pointer: pointer) else { return }
         // Expire old readings, but do no inventory/IO work until the first frame.
         quickActions.updateMetrics(snapshot: activity.latest)
-        let view = QuickActionsPopover(health: health, activity: activity, model: quickActions,
+        storage.refreshIfStale()
+        let view = QuickActionsPopover(health: health, activity: activity, model: quickActions, storage: storage,
             onNavigate: { [weak self] destination in
                 self?.closePopover()
                 self?.onNavigate(destination)

@@ -56,6 +56,7 @@ final class Settings: ObservableObject {
     static let recordActivityHistoryKey = "FastMac.RecordActivityHistory"
     static let activityRetentionDaysKey = "FastMac.ActivityRetentionDays"
     static let notificationsEnabledKey = "FastMac.NotificationsEnabled"
+    static let storageWatchEnabledKey = "FastMac.StorageWatchEnabled"
 
     private enum Key {
         static let exclusions = "fastmac.settings.exclusions"
@@ -94,6 +95,12 @@ final class Settings: ObservableObject {
     }
     @Published var notificationsEnabled: Bool {
         didSet { d.set(notificationsEnabled, forKey: Self.notificationsEnabledKey) }
+    }
+    /// Light, bounded storage readings — see StorageWatch for exactly what is read and when.
+    /// Separate from health monitoring because it lists the temp folder and, once a day,
+    /// measures a fixed set of cache folders.
+    @Published var storageWatchEnabled: Bool {
+        didSet { d.set(storageWatchEnabled, forKey: Self.storageWatchEnabledKey) }
     }
 
     /// Paths a scan should skip entirely. Stored as expanded, standardized absolute
@@ -141,6 +148,7 @@ final class Settings: ObservableObject {
         recordActivityHistory = defaults.object(forKey: Self.recordActivityHistoryKey) as? Bool ?? true
         activityRetentionDays = max(1, min(30, defaults.object(forKey: Self.activityRetentionDaysKey) as? Int ?? 30))
         notificationsEnabled = defaults.object(forKey: Self.notificationsEnabledKey) as? Bool ?? false
+        storageWatchEnabled = defaults.object(forKey: Self.storageWatchEnabledKey) as? Bool ?? true
         exclusions = defaults.stringArray(forKey: Key.exclusions) ?? []
         bigFileThresholdMB = defaults.object(forKey: Key.bigFileThresholdMB) as? Double ?? 50
         untouchedSizeThresholdMB = defaults.object(forKey: Key.untouchedSizeThresholdMB) as? Double ?? 100
