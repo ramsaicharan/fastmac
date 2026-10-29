@@ -5,8 +5,8 @@ cd "$(dirname "$0")/.."
 
 mkdir -p build
 APP="build/FastMac.app"
-VERSION="${FASTMAC_VERSION:-2.0.0}"
-BUILD_NUMBER="${FASTMAC_BUILD:-9}"
+VERSION="${FASTMAC_VERSION:-2.1.0}"
+BUILD_NUMBER="${FASTMAC_BUILD:-10}"
 CONF="${1:-release}"
 case "$CONF" in debug|release) ;; *) echo "usage: scripts/bundle.sh [debug|release]"; exit 2 ;; esac
 SIGNING_IDENTITY="${FASTMAC_SIGNING_IDENTITY--}"

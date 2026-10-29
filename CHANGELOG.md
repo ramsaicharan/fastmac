@@ -2,7 +2,7 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 2.1.0 — storage watch
 
 - **Storage watch.** FastMac now watches *how fast* storage is filling and *where*, not just
   how much is free. The menu bar popup stays quiet until something needs attention, then
