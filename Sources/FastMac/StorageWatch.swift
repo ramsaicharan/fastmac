@@ -15,15 +15,18 @@ import CoreServices
 //   • every 30 minutes, near free: one statfs reading for the trend, and a single-level
 //     listing of the temp folder (names and marker files — no size walk);
 //   • about once a day, at background priority: sizes of a short fixed list of cache
-//     folders, and which large apps have gone unused for months;
+//     folders, which large apps have gone unused for months, and a bounded look at code
+//     projects for leftovers (ProjectLeftovers: folder names a few levels deep, sizes of
+//     only what it reports, a 15-second limit);
 //   • never a scan of its own: it reads the summaries saved by scans you ran yourself.
-// It never walks your documents, never starts a disk scan, and never deletes outright —
-// one-click fixes move things to the Trash, like every other cleanup in FastMac.
+// It runs only while FastMac is open, skips the daily pass in Low Power Mode, never reads
+// file contents, never starts a disk scan, and never deletes outright — one-click fixes
+// move things to the Trash, like every other cleanup in FastMac.
 
 // MARK: Findings
 
 struct StorageFinding: Identifiable {
-    enum Kind: String, Codable { case filling, tempProfiles, cache, dormantApps, staleScan }
+    enum Kind: String, Codable { case filling, tempProfiles, cache, dormantApps, staleScan, leftovers }
 
     enum Action: Equatable {
         /// Safe, done from the popup after a confirmation.
@@ -472,6 +475,47 @@ enum StorageWatchPolicy {
             action: action, actionTitle: action == .open(.history) ? "Compare scans" : "Scan now", blockedReason: nil)
     }
 
+    static let leftoversReportBytes: Int64 = 1_073_741_824
+    static let leftoversAttentionBytes: Int64 = 5 * 1_073_741_824
+
+    /// Old runs and render captures in projects, and agent working copies. Both open
+    /// Categories, where each item is reviewed before anything moves.
+    static func leftovers(_ reading: ProjectLeftovers.Reading) -> [StorageFinding] {
+        var out: [StorageFinding] = []
+        let runs = reading.cleanupItems
+        let runBytes = runs.reduce(Int64(0)) { $0 + $1.bytes }
+        if runBytes >= leftoversReportBytes {
+            let projects = Set(runs.map(\.project))
+            let captures = runs.filter { $0.kind == .renderCapture }.count
+            let names = projects.sorted().prefix(3).joined(separator: ", ") + (projects.count > 3 ? " and \(projects.count - 3) more" : "")
+            out.append(StorageFinding(
+                id: "leftovers-runs", kind: .leftovers,
+                title: "Old runs and captures in \(projects.count) project\(projects.count == 1 ? "" : "s")",
+                detail: "\(names): \(runs.count - captures) older test or audit run\(runs.count - captures == 1 ? "" : "s") beyond the newest \(ProjectLeftovers.keepRuns) per folder"
+                    + (captures > 0 ? ", and \(captures) frame capture\(captures == 1 ? "" : "s") behind finished videos" : "") + ".",
+                bytes: runBytes, estimated: false,
+                urgency: runBytes >= leftoversAttentionBytes ? .attention : .comfortable,
+                note: RiskNote(.caution, what: "Opens Categories → Project Leftovers, where each folder is listed with its project before anything is moved.",
+                               undo: "Finder → Trash → Put Back, until the Trash is emptied."),
+                action: .open(.categories), actionTitle: "Review leftovers", blockedReason: nil))
+        }
+        let copies = reading.worktreeItems
+        let copyBytes = copies.reduce(Int64(0)) { $0 + $1.bytes }
+        if copyBytes >= leftoversReportBytes {
+            let tools = Set(copies.compactMap(\.tool)).sorted().joined(separator: " and ")
+            out.append(StorageFinding(
+                id: "leftovers-worktrees", kind: .leftovers,
+                title: "\(copies.count) working cop\(copies.count == 1 ? "y" : "ies") left by \(tools)",
+                detail: "Agent tools keep a full copy of the project for every task. Copies of \(Set(copies.map(\.project)).sorted().joined(separator: ", ")). Push their branches before removing any.",
+                bytes: copyBytes, estimated: false,
+                urgency: copyBytes >= leftoversAttentionBytes ? .attention : .comfortable,
+                note: RiskNote(.caution, what: "Opens Categories → Project Leftovers. A copy can hold work that was never pushed; check before removing it.",
+                               undo: "Finder → Trash → Put Back, until the Trash is emptied."),
+                action: .open(.categories), actionTitle: "Review copies", blockedReason: nil))
+        }
+        return out
+    }
+
     /// Worst first. When the disk itself is short of room, every finding that would free
     /// a gigabyte or more is promoted, because that is when you need to know where to look.
     static func ranked(_ findings: [StorageFinding], diskStatus: HealthStatus) -> [StorageFinding] {
@@ -511,6 +555,8 @@ struct StorageWatchState: Codable {
     var cachesMeasuredAt: Date?
     var apps: [String: AppUse] = [:]
     var appsCheckedAt: Date?
+    /// Optional, so a state file written before this existed still loads.
+    var leftovers: ProjectLeftovers.Reading?
     /// Finding id → the urgency it was last notified at, so a notification fires on a rise only.
     var notified: [String: String] = [:]
 
@@ -624,7 +670,9 @@ final class StorageWatch: ObservableObject {
             let temp = TempBrowserProfiles.read()
             var caches: [String: CacheReading]? = nil
             var apps: [String: AppUse]? = nil
+            var leftovers: ProjectLeftovers.Reading? = nil
             if daily {
+                leftovers = ProjectLeftovers.read()
                 var measured: [String: CacheReading] = [:]
                 for cache in WatchedCache.all {
                     let existing = cache.absolutePaths.filter { FileManager.default.fileExists(atPath: $0) }
@@ -636,7 +684,7 @@ final class StorageWatch: ObservableObject {
                 apps = DormantApps.inventory(previous: previousApps)
             }
             let history = History.loadAll()
-            let measuredCaches = caches, measuredApps = apps
+            let measuredCaches = caches, measuredApps = apps, measuredLeftovers = leftovers
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.tickInFlight = false
@@ -645,6 +693,7 @@ final class StorageWatch: ObservableObject {
                 self.temp = temp
                 if let measuredCaches { self.state.caches = measuredCaches; self.state.cachesMeasuredAt = now }
                 if let measuredApps { self.state.apps = measuredApps; self.state.appsCheckedAt = now }
+                if let measuredLeftovers { self.state.leftovers = measuredLeftovers }
                 self.history = history
                 self.lastChecked = now
                 self.evaluate(free: disk.free, now: now)
@@ -670,6 +719,7 @@ final class StorageWatch: ObservableObject {
             list.append(dormant)
         }
         if let stale = StorageWatchPolicy.staleScan(entries: history, now: now) { list.append(stale) }
+        if let leftovers = state.leftovers { list += StorageWatchPolicy.leftovers(leftovers) }
 
         let ranked = StorageWatchPolicy.ranked(list, diskStatus: diskStatus())
         findings = ranked
@@ -751,7 +801,9 @@ final class StorageWatch: ObservableObject {
     /// Seeds readings directly. Used by self-checks and render checks only.
     func seed(trend: FreeSpaceTrend? = nil, temp: TempBrowserProfiles.Reading? = nil,
               caches: [String: CacheReading]? = nil, apps: [String: AppUse]? = nil,
-              history: [HistoryEntry]? = nil, free: Int64, now: Date = Date()) {
+              history: [HistoryEntry]? = nil, leftovers: ProjectLeftovers.Reading? = nil,
+              free: Int64, now: Date = Date()) {
+        if let leftovers { state.leftovers = leftovers }
         if let trend { state.trend = trend }
         if let temp { self.temp = temp }
         if let caches { state.caches = caches }

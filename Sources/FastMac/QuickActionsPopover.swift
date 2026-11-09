@@ -491,6 +491,7 @@ private struct StorageCard: View {
         case .cache: "archivebox"
         case .dormantApps: "app.dashed"
         case .staleScan: "clock.arrow.circlepath"
+        case .leftovers: "shippingbox"
         }
     }
 

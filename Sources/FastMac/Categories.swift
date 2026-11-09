@@ -654,6 +654,15 @@ enum Categories {
             staleBuildOutput(root: root),
             oldInstallers(),
             sparseFiles(),
+            projectLeftovers(),
         ]
+    }
+
+    // MARK: 8. Project leftovers
+
+    static func projectLeftovers() -> CategoryGroup {
+        let t0 = Date()
+        let reading = ProjectLeftovers.read()
+        return ProjectLeftovers.categoryGroup(reading, elapsed: Date().timeIntervalSince(t0))
     }
 }

@@ -167,12 +167,15 @@ if args.count >= 2, args[1] == "--storage-watch-now" {
     t = Date()
     let apps = DormantApps.inventory(previous: [:])
     print("  daily apps:    \(ms(t))  (\(apps.count) apps, first pass — later passes reuse unchanged sizes)")
+    t = Date()
+    let leftovers = ProjectLeftovers.read()
+    print("  daily leftovers: \(ms(t))  (\(leftovers.projectsSeen) projects, \(leftovers.items.count) items, \(fmt(leftovers.bytes))\(leftovers.truncated ? ", time limit reached" : ""))")
     let history = History.loadAll()
     MainActor.assumeIsolated {
         let watch = StorageWatch(persists: false, startsTimers: false)
         let sample = HealthProbe.sample()
         watch.diskStatus = { sample.storageStatus }
-        watch.seed(temp: temp, caches: caches, apps: apps, history: history, free: disk.free)
+        watch.seed(temp: temp, caches: caches, apps: apps, history: history, leftovers: leftovers, free: disk.free)
         print("\n  \(watch.findings.count) finding(s) · \(watch.popupFindings.count) for the popup · disk \(sample.storageStatus.rawValue)")
         for f in watch.findings {
             print("    [\(f.urgency.rawValue)] \(f.title)\(f.sizeText.map { " — " + $0 } ?? "")")
@@ -183,6 +186,7 @@ if args.count >= 2, args[1] == "--storage-watch-now" {
     exit(0)
 }
 if args.count >= 2, args[1] == "--storage-watch-check" { runChecks("STORAGE WATCH", StorageWatchSelfCheck.run()) }
+if args.count >= 2, args[1] == "--leftovers-check" { runChecks("PROJECT LEFTOVERS", ProjectLeftoversSelfCheck.run()) }
 if args.count >= 2, args[1] == "--activity-export-check" { runChecks("ACTIVITY EXPORT", ActivityExportSelfCheck.run()) }
 if args.count >= 2, args[1] == "--activity-monitor-check" {
     let application = NSApplication.shared

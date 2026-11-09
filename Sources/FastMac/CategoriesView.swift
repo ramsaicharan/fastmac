@@ -41,7 +41,7 @@ struct CategoriesView: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Category Analyzers").font(.headline)
-                Text("iOS backups, Mail, browsers, dev caches, stale build output, old installers, VM disk images.")
+                Text("iOS backups, Mail, browsers, dev caches, stale build output, old installers, VM disk images, project leftovers.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -60,7 +60,7 @@ struct CategoriesView: View {
             Image(systemName: "square.stack.3d.up.slash")
                 .font(.system(size: 34)).foregroundStyle(.tertiary)
             Text("Nothing scanned yet").font(.title3.weight(.medium))
-            Text("Runs seven targeted analyzers that explain, not just size, the biggest hidden folders on a dev machine.")
+            Text("Runs eight targeted analyzers that explain, not just size, the biggest hidden folders on a dev machine.")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
             Button("Run analyzers") { run() }.buttonStyle(.borderedProminent)

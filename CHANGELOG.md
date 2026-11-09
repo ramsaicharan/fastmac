@@ -2,6 +2,25 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased — project leftovers
+
+- **Project leftovers.** Storage watch's daily pass now also looks inside code projects for
+  what tools leave behind run after run, and Categories lists it as **Project Leftovers**:
+  - **Old test and audit runs** in `audit/`, `output/`, `outputs/`, `reports/`, `captures/`
+    and `evidence/`, beyond the newest three per folder. A run the project's `.gitignore`
+    covers is offered as safe; one git may track needs review.
+  - **Frame captures behind finished videos**: `capture/` folders whose film already has a
+    rendered file in `renders/`. The render itself is never a candidate.
+  - **Agent working copies** that T3 Code and Codex keep per task, offered for review only,
+    since a copy can hold work that was never pushed.
+
+  The popup shows a card from 1 GB and asks for attention from 5 GB; both open Categories,
+  where each folder is reviewed before it moves to the Trash. The pass looks for git projects
+  only in the usual code folders, a few levels deep, never enters a project or a dependency
+  folder, measures only what it reports, and stops after 15 seconds (about 0.4 s across 96
+  projects on the machine it was written for). It runs only while FastMac is open, like the
+  rest of storage watch, and never sends a notification.
+
 ## 2.1.0 — storage watch
 
 - **Storage watch.** FastMac now watches *how fast* storage is filling and *where*, not just

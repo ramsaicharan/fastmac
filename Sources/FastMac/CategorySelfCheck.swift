@@ -120,7 +120,7 @@ enum CategorySelfCheck {
         let t0 = Date()
         let sweep = Categories.sweep()
         let elapsed = Date().timeIntervalSince(t0)
-        check("sweep returns all 7 categories", sweep.count, 7)
+        check("sweep returns all 8 categories", sweep.count, 8)
         checkTrue("sweep category ids are unique", Set(sweep.map { $0.id }).count == sweep.count)
         checkTrue("sweep completes well under a minute on this machine", elapsed < 60)
 
